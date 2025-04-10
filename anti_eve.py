@@ -7,7 +7,6 @@ import itertools
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-#from pathos.multiprocessing import ProcessingPool as Pool
 import scipy
 import scipy.io
 import os
@@ -23,6 +22,127 @@ from math import floor, log2, sqrt
 from numpy.random import randn, rand
 from scipy.signal import lfilter
 from numpy.fft import ifft, fft
+
+
+
+
+
+class ContextualBandit:
+    def __init__(self, action_space, n_training, epsilon_start=1.0, epsilon_min=0.01):
+        """Contextual Bandit with Decaying Epsilon-Greedy Algorithm."""
+        self.action_space = action_space
+        self.n_training = n_training
+        self.epsilon_start = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.decay_factor = n_training / 5  # Adjust for decay speed
+        self.q_values = {}  # Q-values for each (context, action) pair
+        self.action_counts = {}  # Track action selections per context
+
+    def get_q_value(self, context, action):
+        """Retrieve Q-value for (context, action), initialize if not present."""
+        if (context, action) not in self.q_values:
+            self.q_values[(context, action)] = 0.0  # Default Q-value
+            self.action_counts[(context, action)] = 0  # Initialize action count
+        return self.q_values[(context, action)]
+
+    def select_action(self, context, step):
+        """Select an action using an adaptive epsilon-greedy strategy."""
+        # Adaptively decay epsilon based on n_training
+        self.epsilon = self.epsilon_min + (self.epsilon_start - self.epsilon_min) * np.exp(-step / self.decay_factor)
+
+        if np.random.rand() < self.epsilon:  # Explore
+            return random.choice(self.action_space)
+        else:  # Exploit: Pick the action with the highest Q-value for the given context
+            return max(self.action_space, key=lambda action: self.get_q_value(context, action))
+
+    def update_q_values(self, context, action, reward):
+        """Update Q-values using an incremental mean update rule."""
+        # Ensure (context, action) exists in Q-table
+        self.get_q_value(context, action)
+
+        self.action_counts[(context, action)] += 1
+        learning_rate = 1 / self.action_counts[(context, action)]  # Adaptive learning rate
+        self.q_values[(context, action)] += learning_rate * (reward - self.q_values[(context, action)])
+
+    def entropy_to_context(self, x):
+        """Categorizes a single x value."""
+        if 0 <= x < 1:
+            return 0
+        elif 1 <= x < 1.8:
+            return 1
+        elif 1.8 <= x < 2.6:
+            return 2
+        else:  # x >= 2.6
+            return 3
+
+
+class NonContextualBandit:
+    def __init__(self, action_space, n_training, epsilon_start=1.0, epsilon_min=0.01):
+        self.action_space = action_space  # List of available actions
+        self.n_actions = len(action_space)  # Number of actions
+        self.n_training = n_training  # Total training steps
+
+        # Initialize Q-values and counts for each action
+        self.q_values = np.zeros(self.n_actions)  # Estimated rewards
+        self.action_counts = np.zeros(self.n_actions)  # Action selection counts
+
+        # Epsilon parameters
+        self.epsilon_start = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.decay_factor = n_training / 5  # Adjust for decay speed
+
+    def get_epsilon(self, step):
+        """Calculate decaying epsilon based on current step."""
+        return self.epsilon_min + (self.epsilon_start - self.epsilon_min) * np.exp(-step / self.decay_factor)
+
+    def select_action(self, step):
+        """Select action using epsilon-greedy policy."""
+        epsilon = self.get_epsilon(step)
+        if np.random.rand() < epsilon:
+            return random.choice(self.action_space)  # Explore: random action
+        else:
+            return self.action_space[np.argmax(self.q_values)]  # Exploit: best estimated action
+
+    def update_q_values(self, action, reward):
+        """Update Q-values using incremental averaging."""
+        action_index = self.action_space.index(action)
+        self.action_counts[action_index] += 1
+        alpha = 1 / self.action_counts[action_index]  # Learning rate
+        self.q_values[action_index] += alpha * (reward - self.q_values[action_index])  # Update rule
+
+
+class RuleBased:
+    """Baseline model with no reinforcement learning. Actions are chosen by fixed rules."""
+    def __init__(self):
+        pass
+        
+    def select_action(self, context, n_training):
+        """Selects an action based on rules."""
+        if context == 0:
+            return (1,1,0,2)  # No transmission
+        elif context == 1:
+            return (1,1,2,2)  
+        elif context == 2:
+            return (1,1,4,4) 
+        elif context == 3:
+            return (1,1,8,8)  
+        else:
+            return (1,1,2,2)  # Default action if something goes wrong
+
+    def entropy_to_context(self, x):
+        """Categorizes a single x value."""
+        if 0 <= x < 1:
+            return 0
+        elif 1 <= x < 1.8:
+            return 1
+        elif 1.8 <= x < 2.6:
+            return 2
+        else:  # x >= 2.6
+            return 3
+
+
+
+
 
 
 class OFDM_IM_Env:
@@ -44,7 +164,7 @@ class OFDM_IM_Env:
                 1 -> At each iteration: iteration count, throughput, BER_b, BER_e, Entropy, Context, Action, nBits
                 2 -> At each symbol: nErr, Quantization levels, key_a, key_b, key_e, key missmatch Bob, key missmatch Eve
     """
-    def __init__(self, EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, diagnostics, secure=True):
+    def __init__(self, EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, keyEC=True, diagnostics=-1, secure=True):
         self.EbNo_dB_b = EbNo_dB_b
         self.EbNo_dB_e = EbNo_dB_e
         self.nSym = nSym
@@ -68,6 +188,7 @@ class OFDM_IM_Env:
         self.BER_limit_dB = BER_limit_dB
         self.BER_limit_lin = (10 ** (-BER_limit_dB / 10))
         self.channel_type = channel_type
+        self.keyEC = keyEC
         self.diagnostics = diagnostics
         self.secure = secure
         
@@ -79,7 +200,45 @@ class OFDM_IM_Env:
         x = x.reshape([-1, 1])
         mask = 2 ** np.arange(num_bits, dtype=x.dtype).reshape([1, num_bits])
         return np.flip((x & mask).astype(bool).astype(int).reshape(xshape + [num_bits]))
-        
+
+    def _hamming_correct_key(self, key_a, key_b):
+        """Corrects single-bit errors in key_b using Hamming (7,4) error correction, based on key_a."""
+        corrected_key_b = np.copy(key_b)
+        block_size = 4  # Number of data bits per block
+        for i in range(0, len(key_a), block_size):
+            if i + 3 >= len(key_a):  # Ensure we don't exceed the key length
+                break
+            # Extract 4-bit blocks from Alice and Bob
+            d1, d2, d3, d4 = key_a[i:i+4]
+            r1, r2, r3, r4 = key_b[i:i+4]
+
+            # Compute correct parity bits from Alice?s key
+            p1 = d1 ^ d2 ^ d4
+            p2 = d1 ^ d3 ^ d4
+            p3 = d2 ^ d3 ^ d4
+
+            # Compute received parity bits from Bob?s key (as if received incorrectly)
+            p1_b = r1 ^ r2 ^ r4
+            p2_b = r1 ^ r3 ^ r4
+            p3_b = r2 ^ r3 ^ r4
+
+            # Calculate syndrome bits (where the error is)
+            s1 = p1 ^ p1_b
+            s2 = p2 ^ p2_b
+            s3 = p3 ^ p3_b
+
+            # Find the error position in the 7-bit encoded block
+            error_pos = (s3 << 2) | (s2 << 1) | s1  # Convert binary syndrome to decimal
+
+            # Map the 7-bit position to the 4-bit key_b index
+            error_map = {3: 0, 5: 1, 6: 2, 7: 3}  # Only correct data bits
+
+            if error_pos in error_map:
+                bit_index = i + error_map[error_pos]
+                corrected_key_b[bit_index] ^= 1  # Flip the incorrect bit
+
+        return corrected_key_b
+     
     def _generate_constellation(self, M):
         """Generate constellation mapping based on M (modulation order)."""
         if M == 2:
@@ -190,13 +349,11 @@ class OFDM_IM_Env:
         quantized_indices = np.digitize(magnitudes, levels) - 1  # Convert to index
         key_bits = self._unpackbits(quantized_indices, int(np.log2(Q))).reshape(-1) # Convert indices to binary
         return key_bits
-        
     
     def _physical_layer_key_generation(self, K_factor, action, Eb, K, key_len):
+        """Simulate PLKG process."""
         if self.secure == False:
             return np.zeros(key_len, dtype=int), np.zeros(key_len, dtype=int), np.zeros(key_len, dtype=int)
-            
-        """Simulate PLKG process."""
         # ----------------- Alice-Bob channel ---------------------
         if K_factor == 0: # Alice-Bob channel generation
             h_time = sqrt(0.5 / (self.L + 1)) * (np.random.randn(self.L + 1, 1) + 1j * np.random.randn(self.L + 1, 1))
@@ -225,6 +382,9 @@ class OFDM_IM_Env:
         key_a = self._quantize_channel(H_fre_a, Q)[:key_len] # Alice key generation
         key_b = self._quantize_channel(H_fre_b, Q)[:key_len] # Bob key generation
         key_e = self._quantize_channel(H_fre_e, Q)[:key_len] # Eve key generation
+        if self.keyEC:
+            key_b = self._hamming_correct_key(key_a, key_b)
+            key_e = self._hamming_correct_key(key_a, key_e)
         if self.diagnostics == 2:
             print("key_a: ", key_a[:35])
             print("key_b: ", key_b[:35])
@@ -323,148 +483,10 @@ class OFDM_IM_Env:
         return reward, throughput, BER_b, BER_e
 
 
-class ContextualBandit:
-    def __init__(self, action_space, total_steps):
-        self.action_space = action_space  # List of possible (n, k, M, Q) actions
-        self.total_steps = total_steps  # Total number of training steps
-        self.successes = {}  # Track number of successful transmissions
-        self.failures = {}  # Track number of failed transmissions
-
-    def get_counts(self, context, action):
-        """Retrieve (success, failure) counts for (context, action) or initialize them."""
-        if (context, action) not in self.successes:
-            self.successes[(context, action)] = 1  # Pseudo-count to avoid division by zero
-            self.failures[(context, action)] = 1
-        return self.successes[(context, action)], self.failures[(context, action)]
-
-    def select_action(self, context):
-        """Thompson Sampling: Sample from Beta distribution and pick the best action."""
-        sampled_values = []
-        
-        for action in self.action_space:
-            success, failure = self.get_counts(context, action)
-            sampled_values.append(np.random.beta(success, failure))  # Sample from Beta(success, failure)
-
-        best_action = self.action_space[np.argmax(sampled_values)]  # Pick the action with the highest sampled value
-        return best_action
-
-    def update_q_values(self, context, action, reward):
-        """ Update success/failure counts based on the reward received. """
-        if reward > 0:  # If transmission was successful (BER below threshold)
-            self.successes[(context, action)] += 1
-        else:  # If transmission failed (BER too high)
-            self.failures[(context, action)] += 1
-    
-    def entropy_to_context(self, x):
-        """Categorizes a single x value."""
-        if 0 <= x < 1:
-            return 0
-        elif 1 <= x < 1.8:
-            return 1
-        elif 1.8 <= x < 2.6:
-            return 2
-        else:  # x >= 2.6
-            return 3
-
-
-class NonContextualBandit:
-    def __init__(self, action_space):
-        self.action_space = action_space  # List of possible (n, k, M, Q) actions
-        self.successes = {action: 1 for action in self.action_space}  # Pseudo-count to avoid zero division
-        self.failures = {action: 1 for action in self.action_space}
-
-    def select_action(self):
-        """Thompson Sampling: Sample from Beta distribution and pick the best action."""
-        sampled_values = [
-            np.random.beta(self.successes[action], self.failures[action]) for action in self.action_space
-        ]
-        best_action = self.action_space[np.argmax(sampled_values)]
-        return best_action
-
-    def update_q_values(self, action, reward):
-        """Update success/failure counts based on the reward received."""
-        if reward > 0:  # If transmission was successful (BER below threshold)
-            self.successes[action] += 1
-        else:  # If transmission failed (BER too high)
-            self.failures[action] += 1
-
-
-class RuleBased:
-    """Baseline model with no reinforcement learning. Actions are chosen by fixed rules."""
-    def __init__(self):
-        pass
-        
-    def select_action(self, context):
-        """Selects an action based on rules."""
-        if context == 0:
-            return (1,1,0,2)  # No transmission
-        elif context == 1:
-            return (1,1,2,2)  
-        elif context == 2:
-            return (1,1,4,4) 
-        elif context == 3:
-            return (1,1,8,8)  
-        else:
-            return (1,1,2,2)  # Default action if something goes wrong
-
-    def entropy_to_context(self, x):
-        """Categorizes a single x value."""
-        if 0 <= x < 1:
-            return 0
-        elif 1 <= x < 1.8:
-            return 1
-        elif 1.8 <= x < 2.6:
-            return 2
-        else:  # x >= 2.6
-            return 3
-
-class ContextualUnsecureBandit:
-    def __init__(self, action_space, total_steps):
-        self.action_space = action_space  # List of possible (n, k, M, Q) actions
-        self.total_steps = total_steps  # Total number of training steps
-        self.successes = {}  # Track number of successful transmissions
-        self.failures = {}  # Track number of failed transmissions
-
-    def get_counts(self, context, action):
-        """Retrieve (success, failure) counts for (context, action) or initialize them."""
-        if (context, action) not in self.successes:
-            self.successes[(context, action)] = 1  # Pseudo-count to avoid division by zero
-            self.failures[(context, action)] = 1
-        return self.successes[(context, action)], self.failures[(context, action)]
-
-    def select_action(self, context):
-        """Thompson Sampling: Sample from Beta distribution and pick the best action."""
-        sampled_values = []
-        
-        for action in self.action_space:
-            success, failure = self.get_counts(context, action)
-            sampled_values.append(np.random.beta(success, failure))  # Sample from Beta(success, failure)
-
-        best_action = self.action_space[np.argmax(sampled_values)]  # Pick the action with the highest sampled value
-        return best_action
-
-    def update_q_values(self, context, action, reward):
-        """ Update success/failure counts based on the reward received. """
-        if reward > 0:  # If transmission was successful (BER below threshold)
-            self.successes[(context, action)] += 1
-        else:  # If transmission failed (BER too high)
-            self.failures[(context, action)] += 1
-    
-    def entropy_to_context(self, x):
-        """Categorizes a single x value."""
-        if 0 <= x < 1:
-            return 0
-        elif 1 <= x < 1.8:
-            return 1
-        elif 1.8 <= x < 2.6:
-            return 2
-        else:  # x >= 2.6
-            return 3
-            
 def main_run(sim_mode, action_space, 
                 nSym=100, N=128, Ncp=16, L=5, ICSI=True,
                 EbNo_dB_b=15, EbNo_dB_e=10, BER_limit_dB=30, 
-                n_MC=2, n_training=5, n_test=3, channel_type="Rayleigh", diagnostics=0):
+                n_MC=2, n_training=5, n_test=3, channel_type="Rayleigh", keyEC= True, diagnostics=0):
     """
     Unified simulation function that runs Contextual Bandit, Non-Contextual Bandit, or Rule-Based models.
 
@@ -502,18 +524,18 @@ def main_run(sim_mode, action_space,
 
     for ii in range(n_MC):
         if sim_mode == "insecure_icsi":
-            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, diagnostics, False)
+            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, keyEC, diagnostics, False)
         elif sim_mode == "insecure_pcsi": 
-            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, False, BER_limit_dB, channel_type, diagnostics, False)
+            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, False, BER_limit_dB, channel_type, keyEC, diagnostics, False)
         else:
-            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, diagnostics, True)
+            env = OFDM_IM_Env(EbNo_dB_b, EbNo_dB_e, nSym, N, Ncp, L, ICSI, BER_limit_dB, channel_type, keyEC, diagnostics, True)
         
         # Initialize model based on sim_mode
         if sim_mode in ["contextual_bandit", "insecure_icsi", "insecure_pcsi"]:
-            model = ContextualBandit(action_space=action_space, total_steps=n_training)
+            model = ContextualBandit(action_space=action_space, n_training=n_training)
             context = random.choice([1, 2, 3])
         elif sim_mode == "noncontextual_bandit":
-            model = NonContextualBandit(action_space=action_space)
+            model = NonContextualBandit(action_space=action_space, n_training=n_training)
         elif sim_mode == "rulebased":
             model = RuleBased()
             context = random.choice([1, 2, 3])
@@ -522,14 +544,13 @@ def main_run(sim_mode, action_space,
 
         # Set initial K-factor
         K_factor = {"Rayleigh": 0, "Rician_K=1": 1, "Rician_K=10": 10}.get(channel_type, None)
-
         if sim_mode != "rulebased":
             #for i in tqdm(range(n_training), desc=f"Training {sim_mode}", leave=True):
             for i in range(n_training):
                 if channel_type == "Dynamic" and i % 10 == 0:
                     K_factor = np.random.choice(np.logspace(-2, 2, 10))
     
-                action = model.select_action(context) if sim_mode in ["contextual_bandit", "insecure_icsi", "insecure_pcsi"] else model.select_action()
+                action = model.select_action(context, i) if sim_mode in ["contextual_bandit", "insecure_icsi", "insecure_pcsi"] else model.select_action(i)
                 nErr_b, nErr_e, nBits, entropy = env.symbol_transmission(action, K_factor)
                 reward, throughput, BER_b, BER_e = env.reward_function(action, nErr_b, nErr_e, nBits)
     
@@ -546,7 +567,7 @@ def main_run(sim_mode, action_space,
         for i in range(n_test):
             if channel_type == "Dynamic" and i % 10 == 0:
                 K_factor = np.random.choice(np.logspace(-2, 2, 10))
-            action = model.select_action(context) if sim_mode in ["contextual_bandit", "rulebased", "insecure_icsi", "insecure_pcsi"] else model.select_action()
+            action = model.select_action(context, n_training) if sim_mode in ["contextual_bandit", "rulebased", "insecure_icsi", "insecure_pcsi"] else model.select_action(n_training)
             nErr_b, nErr_e, nBits, entropy = env.symbol_transmission(action, K_factor)
             reward, throughput, BER_b, BER_e = env.reward_function(action, nErr_b, nErr_e, nBits)
             
@@ -560,7 +581,7 @@ def main_run(sim_mode, action_space,
         return np.mean(avg_throughput), np.nanmean(avg_BER_b), np.nanmean(avg_BER_e)
     else:
         return avg_throughput, avg_BER_b, avg_BER_e, env, model
-    
+        
 def generate_param_sets(param_name, param_values, base_params):
     """
     Generates parameter sets for parallel execution, varying only the specified parameter.
@@ -598,31 +619,33 @@ def generate_param_sets(param_name, param_values, base_params):
 
 
 
+
 if __name__ == "__main__":
 
     # ----------------- Set simulation parameter ---------------------
     # "EbNo_dB_b", "EbNo_dB_e", "BER_limit_dB", np.arange(-2, 30, 2)
     base_params = {
         "nSym": 100,
-        "N": 64,
+        "N": 128,
         "Ncp": 16,
         "L": 5,
         "ICSI": True,
         "EbNo_dB_b": 25,
         "EbNo_dB_e": 15,
         "BER_limit_dB": 15,
-        "n_MC": 200,
+        "n_MC": 100,
         "n_training": 500,
-        "n_test": 300,
+        "n_test": 500,
         "channel_type": "Dynamic",
+        "keyEC": True,
         "diagnostics": -1
     }
-    param_values =  np.arange(-2, 30, 22)  # np.arange(-2, 30, 2)
+    param_values = np.arange(-2, 30, 2)  #np.arange(20, 300, 20)  # np.arange(-2, 30, 2)
     param_name = "EbNo_dB_b"
     param_sets = generate_param_sets(param_name, param_values, base_params)
 
     # ----------------- Parallel Run ---------------------
-    with Pool(0) as p:
+    with Pool(112) as p:
         results_ = p.starmap(main_run, param_sets)
 
     # ----------------- Post-process ---------------------
